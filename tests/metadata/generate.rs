@@ -1,12 +1,15 @@
-use std::fs::File;
-//use std::io::prelude::*;
+use data_encoding::{BASE64URL, HEXLOWER};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::prelude::*;
 use std::path::Path;
 //use tuf::crypto::{HashAlgorithm, KeyId, PrivateKey, SignatureScheme};
-//use serde_json::{Result, Value};
 use futures_executor::block_on;
+use serde::de::{Deserialize, Deserializer, Error as DeserializeError};
+use serde::ser::{Error as SerializeError, Serialize, Serializer};
+use serde_derive::{Deserialize, Serialize};
 use std::process::Command;
-use tuf::crypto::{HashAlgorithm, PrivateKey, SignatureScheme};
+use tuf::crypto::{HashAlgorithm, KeyId, KeyType, PrivateKey, SignatureScheme};
 use tuf::interchange::Json;
 use tuf::metadata::{
     Metadata, MetadataPath, MetadataVersion, Role, RootMetadataBuilder, SignedMetadata,
@@ -15,8 +18,8 @@ use tuf::metadata::{
 };
 use tuf::repository::{FileSystemRepository, FileSystemRepositoryBuilder, Repository};
 use tuf::Result;
+// TODO clean up all warnings
 
-// TODO pass these in instead.
 // TODO: use the same keys as the go-tuf repo?
 const ED25519_1_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-1.pk8.der");
 const ED25519_2_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-2.pk8.der");
@@ -24,17 +27,39 @@ const ED25519_3_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-3.pk8.de
 const ED25519_4_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-4.pk8.der");
 //const keys_path = "./keys.json";
 
-// TODO: Read the keys in from the json file copied from the Go repo?
-// or just regenerate them in pk8?
-/*fn keys_from_json(path: &str) -> serde_json::Result<()> {
-    let f = File::open(path).expect("failed to open keys file");
-    let mut contents = String::new();
-    f.read_to_string(&mut contents).expect("failed to read keys");
-    let keys : serde_json::Value = serde_json::from_str(contents).expect("serde failed");
-}*/
+//#[derive(Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
+//struct KeyValue(#[serde(with = "crate::format_hex")] Vec<u8>);
 
-// Maps each role to a key.
-type test_keys = HashMap<&'static str, PrivateKey>;
+#[derive(Clone, Deserialize)]
+struct TestKeyPair {
+    typ: KeyType,
+    key_id: KeyId,
+    scheme: SignatureScheme,
+    keyid_hash_algorithms: Option<Vec<String>>,
+    public: String,
+    private: String,
+}
+
+#[derive(Deserialize)]
+struct TestKeys {
+    root: Vec<TestKeyPair>,
+    targets: Vec<TestKeyPair>,
+    snapshot: Vec<TestKeyPair>,
+    timestamp: Vec<TestKeyPair>,
+}
+
+fn init_test_keys(path: &str) -> TestKeys {
+    let mut f = File::open(path).expect("failed to open keys file");
+    let mut contents = String::new();
+    f.read_to_string(&mut contents)
+        .expect("failed to read keys");
+    let keys: TestKeys = serde_json::from_str(&contents).expect("serde failed");
+    return keys;
+    // TODO shove these keys into the right format, then use them instead.
+}
+
+// Maps each role to its current key.
+type RoleKeys = HashMap<&'static str, PrivateKey>;
 
 fn copy_repo(dir: &str, step: u8) {
     let src = Path::new(dir)
@@ -70,36 +95,47 @@ fn init_test_keys() -> test_keys {
     keys
 }
 
-// TODO something better about the root signer
+// updates the root metadata. If root_signer is Some, use that to sign the
+// metadata, otherwise use keys["root"].
 async fn update_root(
     repo: &FileSystemRepository<Json>,
     keys: &test_keys,
-    root_signer: &PrivateKey,
+    root_signer: Option<&PrivateKey>,
+    version: u32,
     consistent_snapshot: bool,
 ) {
+    let signer = match root_signer {
+        Some(k) => k,
+        None => keys.get("root").unwrap(),
+    };
+
     let root = RootMetadataBuilder::new()
         .root_key(keys.get("root").unwrap().public().clone())
         .snapshot_key(keys.get("snapshot").unwrap().public().clone())
         .targets_key(keys.get("targets").unwrap().public().clone())
         .timestamp_key(keys.get("timestamp").unwrap().public().clone())
         .consistent_snapshot(consistent_snapshot)
-        // Don't know if this needs to be a reference.
-        .signed::<Json>(&root_signer)
+        .signed::<Json>(signer)
         .unwrap();
 
     let root_path = MetadataPath::from_role(&Role::Root);
-    repo.store_metadata(&root_path, &MetadataVersion::Number(1), &root)
-        .await;
+    repo.store_metadata(&root_path, &MetadataVersion::Number(version), &root)
+        .await
+        .unwrap();
     repo.store_metadata(&root_path, &MetadataVersion::None, &root)
-        .await;
+        .await
+        .unwrap();
 }
 
-async fn add_target(repo: &FileSystemRepository<Json>, keys: &test_keys, step: u8) {
+// adds a target and updates the non-root metadata files.
+async fn add_target(
+    repo: &FileSystemRepository<Json>,
+    keys: &test_keys,
+    step: u8,
+    consistent_snapshot: bool,
+) {
     let targets_path = MetadataPath::from_role(&Role::Targets);
     let target_data: &[u8] = &[step];
-    let target_path = TargetPath::new(step.to_string().into()).unwrap();
-
-    repo.store_target(target_data, &target_path).await;
 
     let targets = TargetsMetadataBuilder::new()
         .insert_target_from_reader(
@@ -111,9 +147,32 @@ async fn add_target(repo: &FileSystemRepository<Json>, keys: &test_keys, step: u
         .signed::<Json>(&keys.get("targets").unwrap())
         .unwrap();
 
-    let targets_path = &MetadataPath::new("targets").unwrap();
-    repo.store_metadata(&targets_path, &MetadataVersion::None, &targets)
-        .await;
+    let hash = targets
+        .as_ref()
+        .targets()
+        .get(&VirtualTargetPath::new(step.to_string().into()).unwrap())
+        .unwrap()
+        .hashes()
+        .get(&HashAlgorithm::Sha256)
+        .unwrap();
+
+    let target_str = if consistent_snapshot {
+        format!("{}.{}", hash, step.to_string())
+    } else {
+        step.to_string()
+    };
+    let target_path = TargetPath::new(target_str.into()).unwrap();
+    repo.store_target(target_data, &target_path).await.unwrap();
+
+    let version = if consistent_snapshot {
+        MetadataVersion::Number((step + 1).into())
+    } else {
+        MetadataVersion::None
+    };
+
+    repo.store_metadata(&targets_path, &version, &targets)
+        .await
+        .unwrap();
 
     let snapshot_path = MetadataPath::from_role(&Role::Snapshot);
     let snapshot = SnapshotMetadataBuilder::new()
@@ -122,14 +181,23 @@ async fn add_target(repo: &FileSystemRepository<Json>, keys: &test_keys, step: u
         .signed::<Json>(&keys.get("snapshot").unwrap())
         .unwrap();
 
+    repo.store_metadata(&snapshot_path, &version, &snapshot)
+        .await
+        .unwrap();
+
     let timestamp_path = MetadataPath::from_role(&Role::Timestamp);
     let timestamp = TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
         .unwrap()
         .signed::<Json>(&keys.get("timestamp").unwrap())
         .unwrap();
+
+    // Timestamp doesn't require a version even in consistent_snapshot.
+    repo.store_metadata(&timestamp_path, &MetadataVersion::None, &timestamp)
+        .await
+        .unwrap();
 }
 
-fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
+async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
     // Create initial repo.
     println!("generate_repos: {}", consistent_snapshot);
     let mut keys = init_test_keys();
@@ -139,64 +207,76 @@ fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
         .targets_prefix(Path::new("repository").join("targets"))
         .build()?;
 
-    block_on(async {
-        update_root(&repo, &keys, keys.get("root").unwrap(), consistent_snapshot).await;
-        add_target(&repo, &keys, 0).await;
-    });
+    update_root(&repo, &keys, None, 1, consistent_snapshot).await;
+    add_target(&repo, &keys, 0, consistent_snapshot).await;
 
     let mut i: u8 = 1;
-    let roles = vec![Role::Root, Role::Targets, Role::Snapshot, Role::Timestamp];
-    block_on(async {
-        for r in roles.iter() {
-            // Initialize new repo and copy the files from the previous step.
-            let dir_i = Path::new(dir).join(i.to_string());
-            let repo = FileSystemRepositoryBuilder::new(dir_i)
-                .metadata_prefix(Path::new("repository"))
-                .targets_prefix(Path::new("repository").join("targets"))
-                .build()
-                .unwrap();
-            copy_repo(dir, i);
+    let rotations = vec![
+        Some(Role::Root),
+        Some(Role::Targets),
+        Some(Role::Snapshot),
+        Some(Role::Timestamp),
+        None,
+    ];
+    for r in rotations.iter() {
+        // Initialize new repo and copy the files from the previous step.
+        let dir_i = Path::new(dir).join(i.to_string());
+        let repo = FileSystemRepositoryBuilder::new(dir_i)
+            .metadata_prefix(Path::new("repository"))
+            .targets_prefix(Path::new("repository").join("targets"))
+            .build()
+            .unwrap();
+        copy_repo(dir, i);
 
-            // TODO  impl clone for keys, I gues???
-            //let root_signer = keys.get("root").unwrap();
-            //
-            let root_signer =
-                PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap();
-            match r {
-                // TODO figure out which keys to use
-                Role::Root => keys.insert(
-                    "root",
-                    PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                ),
-                Role::Targets => keys.insert(
+        let root_signer: Option<PrivateKey> = match r {
+            Some(Role::Root) => keys.insert(
+                "root",
+                PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
+            ),
+            Some(Role::Targets) => {
+                keys.insert(
                     "targets",
                     PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                ),
-                Role::Snapshot => keys.insert(
+                );
+                None
+            }
+            Some(Role::Snapshot) => {
+                keys.insert(
                     "snapshot",
                     PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                ),
-                Role::Timestamp => keys.insert(
+                );
+                None
+            }
+            Some(Role::Timestamp) => {
+                keys.insert(
                     "timestamp",
                     PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                ),
-            };
-            update_root(&repo, &keys, &root_signer, consistent_snapshot).await;
-            add_target(&repo, &keys, i).await;
-            i = i + 1;
-        }
-    });
-    // TODO add the final target.
+                );
+                None
+            }
+            None => None,
+        };
+        update_root(
+            &repo,
+            &keys,
+            root_signer.as_ref(),
+            (i + 1).into(), // Root version starts at 1 in step 0.
+            consistent_snapshot,
+        )
+        .await;
+        add_target(&repo, &keys, i, consistent_snapshot).await;
+        i = i + 1;
+    }
     Ok(())
 }
 
-// TODO delete this if we don't move main to separate file
-pub fn generate(dir: &str, consistent_snapshot: bool) -> Result<()> {
-    generate_repos(dir, consistent_snapshot)
-}
-
-// TODO move to a separate file or nah?
 fn main() {
-    generate("consistent-snapshot-true", true).unwrap();
-    generate("consistent-snapshot-false", false).unwrap();
+    block_on(async {
+        generate_repos("consistent-snapshot-true", true)
+            .await
+            .unwrap();
+        generate_repos("consistent-snapshot-false", false)
+            .await
+            .unwrap();
+    })
 }
