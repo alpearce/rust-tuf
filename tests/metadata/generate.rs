@@ -48,7 +48,7 @@ struct TestKeys {
     timestamp: Vec<TestKeyPair>,
 }
 
-fn init_test_keys(path: &str) -> TestKeys {
+fn init_json_keys(path: &str) -> TestKeys {
     let mut f = File::open(path).expect("failed to open keys file");
     let mut contents = String::new();
     f.read_to_string(&mut contents)
@@ -74,7 +74,7 @@ fn copy_repo(dir: &str, step: u8) {
         .expect("cp failed");
 }
 
-fn init_test_keys() -> test_keys {
+fn init_role_keys() -> RoleKeys {
     let mut keys = HashMap::new();
     keys.insert(
         "root",
@@ -99,7 +99,7 @@ fn init_test_keys() -> test_keys {
 // metadata, otherwise use keys["root"].
 async fn update_root(
     repo: &FileSystemRepository<Json>,
-    keys: &test_keys,
+    keys: &RoleKeys,
     root_signer: Option<&PrivateKey>,
     version: u32,
     consistent_snapshot: bool,
@@ -130,7 +130,7 @@ async fn update_root(
 // adds a target and updates the non-root metadata files.
 async fn add_target(
     repo: &FileSystemRepository<Json>,
-    keys: &test_keys,
+    keys: &RoleKeys,
     step: u8,
     consistent_snapshot: bool,
 ) {
@@ -200,7 +200,7 @@ async fn add_target(
 async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
     // Create initial repo.
     println!("generate_repos: {}", consistent_snapshot);
-    let mut keys = init_test_keys();
+    let mut keys = init_role_keys();
     let dir0 = Path::new(dir).join("0");
     let repo = FileSystemRepositoryBuilder::new(dir0)
         .metadata_prefix(Path::new("repository"))
