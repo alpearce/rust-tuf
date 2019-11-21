@@ -1,34 +1,21 @@
-use data_encoding::{BASE64URL, HEXLOWER};
+use data_encoding::HEXLOWER;
+use futures_executor::block_on;
+use serde_derive::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
-//use tuf::crypto::{HashAlgorithm, KeyId, PrivateKey, SignatureScheme};
-use futures_executor::block_on;
-use serde::de::{Deserialize, Deserializer, Error as DeserializeError};
-use serde::ser::{Error as SerializeError, Serialize, Serializer};
-use serde_derive::{Deserialize, Serialize};
 use std::process::Command;
 use tuf::crypto::{HashAlgorithm, KeyId, KeyType, PrivateKey, SignatureScheme};
 use tuf::interchange::Json;
 use tuf::metadata::{
-    Metadata, MetadataPath, MetadataVersion, Role, RootMetadataBuilder, SignedMetadata,
-    SnapshotMetadataBuilder, TargetPath, TargetsMetadataBuilder, TimestampMetadataBuilder,
-    VirtualTargetPath,
+    MetadataPath, MetadataVersion, Role, RootMetadataBuilder, SnapshotMetadataBuilder, TargetPath,
+    TargetsMetadataBuilder, TimestampMetadataBuilder, VirtualTargetPath,
 };
 use tuf::repository::{FileSystemRepository, FileSystemRepositoryBuilder, Repository};
-use tuf::Result;
-// TODO clean up all warnings
 
-// TODO: use the same keys as the go-tuf repo?
-const ED25519_1_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-1.pk8.der");
-const ED25519_2_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-2.pk8.der");
-const ED25519_3_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-3.pk8.der");
-const ED25519_4_PK8: &'static [u8] = include_bytes!("../ed25519/ed25519-4.pk8.der");
-//const keys_path = "./keys.json";
-
-//#[derive(Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
-//struct KeyValue(#[serde(with = "crate::format_hex")] Vec<u8>);
+// TODO how to parametrize this better/find it within the build?
+const KEYS_PATH: &str = "./keys.json";
 
 #[derive(Clone, Deserialize)]
 struct TestKeyPair {
@@ -38,6 +25,16 @@ struct TestKeyPair {
     keyid_hash_algorithms: Option<Vec<String>>,
     public: String,
     private: String,
+}
+
+impl TestKeyPair {
+    fn to_private_key(&self) -> PrivateKey {
+        let mut priv_bytes = HEXLOWER.decode(self.private.as_bytes()).unwrap();
+        let mut pub_bytes = HEXLOWER.decode(self.public.as_bytes()).unwrap();
+        priv_bytes.append(&mut pub_bytes);
+        let pk = PrivateKey::from_ed25519(&priv_bytes[..]).unwrap();
+        return pk;
+    }
 }
 
 #[derive(Deserialize)]
@@ -55,11 +52,19 @@ fn init_json_keys(path: &str) -> TestKeys {
         .expect("failed to read keys");
     let keys: TestKeys = serde_json::from_str(&contents).expect("serde failed");
     return keys;
-    // TODO shove these keys into the right format, then use them instead.
 }
 
 // Maps each role to its current key.
 type RoleKeys = HashMap<&'static str, PrivateKey>;
+
+fn init_role_keys(json_keys: &TestKeys) -> RoleKeys {
+    let mut keys = HashMap::new();
+    keys.insert("root", json_keys.root[0].to_private_key());
+    keys.insert("snapshot", json_keys.snapshot[0].to_private_key());
+    keys.insert("targets", json_keys.targets[0].to_private_key());
+    keys.insert("timestamp", json_keys.timestamp[0].to_private_key());
+    keys
+}
 
 fn copy_repo(dir: &str, step: u8) {
     let src = Path::new(dir)
@@ -72,27 +77,6 @@ fn copy_repo(dir: &str, step: u8) {
         .arg(dst.to_str().unwrap())
         .spawn()
         .expect("cp failed");
-}
-
-fn init_role_keys() -> RoleKeys {
-    let mut keys = HashMap::new();
-    keys.insert(
-        "root",
-        PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-    );
-    keys.insert(
-        "snapshot",
-        PrivateKey::from_pkcs8(ED25519_2_PK8, SignatureScheme::Ed25519).unwrap(),
-    );
-    keys.insert(
-        "targets",
-        PrivateKey::from_pkcs8(ED25519_3_PK8, SignatureScheme::Ed25519).unwrap(),
-    );
-    keys.insert(
-        "timestamp",
-        PrivateKey::from_pkcs8(ED25519_4_PK8, SignatureScheme::Ed25519).unwrap(),
-    );
-    keys
 }
 
 // updates the root metadata. If root_signer is Some, use that to sign the
@@ -200,7 +184,9 @@ async fn add_target(
 async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
     // Create initial repo.
     println!("generate_repos: {}", consistent_snapshot);
-    let mut keys = init_role_keys();
+    // TODO: impl is very tied to the json keys file. Should it be more flexible?
+    let json_keys = init_json_keys(KEYS_PATH);
+    let mut keys = init_role_keys(&json_keys);
     let dir0 = Path::new(dir).join("0");
     let repo = FileSystemRepositoryBuilder::new(dir0)
         .metadata_prefix(Path::new("repository"))
@@ -229,29 +215,17 @@ async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()>
         copy_repo(dir, i);
 
         let root_signer: Option<PrivateKey> = match r {
-            Some(Role::Root) => keys.insert(
-                "root",
-                PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-            ),
+            Some(Role::Root) => keys.insert("root", json_keys.root[1].to_private_key()),
             Some(Role::Targets) => {
-                keys.insert(
-                    "targets",
-                    PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                );
+                keys.insert("targets", json_keys.targets[1].to_private_key());
                 None
             }
             Some(Role::Snapshot) => {
-                keys.insert(
-                    "snapshot",
-                    PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                );
+                keys.insert("snapshot", json_keys.snapshot[1].to_private_key());
                 None
             }
             Some(Role::Timestamp) => {
-                keys.insert(
-                    "timestamp",
-                    PrivateKey::from_pkcs8(ED25519_1_PK8, SignatureScheme::Ed25519).unwrap(),
-                );
+                keys.insert("timestamp", json_keys.timestamp[1].to_private_key());
                 None
             }
             None => None,
