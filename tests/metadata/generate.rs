@@ -6,7 +6,7 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::process::Command;
-use tuf::crypto::{HashAlgorithm, KeyId, KeyType, PrivateKey, SignatureScheme};
+use tuf::crypto::{HashAlgorithm, KeyType, PrivateKey, SignatureScheme};
 use tuf::interchange::Json;
 use tuf::metadata::{
     MetadataPath, MetadataVersion, Role, RootMetadataBuilder, SnapshotMetadataBuilder, TargetPath,
@@ -14,24 +14,30 @@ use tuf::metadata::{
 };
 use tuf::repository::{FileSystemRepository, FileSystemRepositoryBuilder, Repository};
 
-// TODO how to parametrize this better/find it within the build?
+// TODO parametrize this better/find it within the build?
 const KEYS_PATH: &str = "./keys.json";
 
+// These structs and functions are necessary to parse keys.json, which contains the keys
+// used by go-tuf to generate the equivalent metadata. We use the same keys to facilitate
+// compatibility testing.
+
 #[derive(Clone, Deserialize)]
-struct TestKeyPair {
-    typ: KeyType,
-    key_id: KeyId,
-    scheme: SignatureScheme,
-    keyid_hash_algorithms: Option<Vec<String>>,
+struct KeyValue {
     public: String,
     private: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct TestKeyPair {
+    keytype: KeyType,
+    scheme: SignatureScheme,
+    keyid_hash_algorithms: Option<Vec<String>>,
+    keyval: KeyValue,
+}
+
 impl TestKeyPair {
     fn to_private_key(&self) -> PrivateKey {
-        let mut priv_bytes = HEXLOWER.decode(self.private.as_bytes()).unwrap();
-        let mut pub_bytes = HEXLOWER.decode(self.public.as_bytes()).unwrap();
-        priv_bytes.append(&mut pub_bytes);
+        let priv_bytes = HEXLOWER.decode(self.keyval.private.as_bytes()).unwrap();
         let pk = PrivateKey::from_ed25519(&priv_bytes[..]).unwrap();
         return pk;
     }
@@ -39,10 +45,10 @@ impl TestKeyPair {
 
 #[derive(Deserialize)]
 struct TestKeys {
-    root: Vec<TestKeyPair>,
-    targets: Vec<TestKeyPair>,
-    snapshot: Vec<TestKeyPair>,
-    timestamp: Vec<TestKeyPair>,
+    root: Vec<Vec<TestKeyPair>>,
+    targets: Vec<Vec<TestKeyPair>>,
+    snapshot: Vec<Vec<TestKeyPair>>,
+    timestamp: Vec<Vec<TestKeyPair>>,
 }
 
 fn init_json_keys(path: &str) -> TestKeys {
@@ -54,15 +60,15 @@ fn init_json_keys(path: &str) -> TestKeys {
     return keys;
 }
 
-// Maps each role to its current key.
+// Map each role to its current key.
 type RoleKeys = HashMap<&'static str, PrivateKey>;
 
 fn init_role_keys(json_keys: &TestKeys) -> RoleKeys {
     let mut keys = HashMap::new();
-    keys.insert("root", json_keys.root[0].to_private_key());
-    keys.insert("snapshot", json_keys.snapshot[0].to_private_key());
-    keys.insert("targets", json_keys.targets[0].to_private_key());
-    keys.insert("timestamp", json_keys.timestamp[0].to_private_key());
+    keys.insert("root", json_keys.root[0][0].to_private_key());
+    keys.insert("snapshot", json_keys.snapshot[0][0].to_private_key());
+    keys.insert("targets", json_keys.targets[0][0].to_private_key());
+    keys.insert("timestamp", json_keys.timestamp[0][0].to_private_key());
     keys
 }
 
@@ -119,7 +125,8 @@ async fn add_target(
     consistent_snapshot: bool,
 ) {
     let targets_path = MetadataPath::from_role(&Role::Targets);
-    let target_data: &[u8] = &[step];
+    let step_str = format!("{}", step);
+    let target_data: &[u8] = step_str.as_bytes();
 
     let targets = TargetsMetadataBuilder::new()
         .insert_target_from_reader(
@@ -183,8 +190,7 @@ async fn add_target(
 
 async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()> {
     // Create initial repo.
-    println!("generate_repos: {}", consistent_snapshot);
-    // TODO: impl is very tied to the json keys file. Should it be more flexible?
+    // TODO: @erickt, this impl is very tied to the json keys file. Do we need it to be more flexible?
     let json_keys = init_json_keys(KEYS_PATH);
     let mut keys = init_role_keys(&json_keys);
     let dir0 = Path::new(dir).join("0");
@@ -215,17 +221,17 @@ async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()>
         copy_repo(dir, i);
 
         let root_signer: Option<PrivateKey> = match r {
-            Some(Role::Root) => keys.insert("root", json_keys.root[1].to_private_key()),
+            Some(Role::Root) => keys.insert("root", json_keys.root[1][0].to_private_key()),
             Some(Role::Targets) => {
-                keys.insert("targets", json_keys.targets[1].to_private_key());
+                keys.insert("targets", json_keys.targets[1][0].to_private_key());
                 None
             }
             Some(Role::Snapshot) => {
-                keys.insert("snapshot", json_keys.snapshot[1].to_private_key());
+                keys.insert("snapshot", json_keys.snapshot[1][0].to_private_key());
                 None
             }
             Some(Role::Timestamp) => {
-                keys.insert("timestamp", json_keys.timestamp[1].to_private_key());
+                keys.insert("timestamp", json_keys.timestamp[1][0].to_private_key());
                 None
             }
             None => None,
@@ -234,7 +240,7 @@ async fn generate_repos(dir: &str, consistent_snapshot: bool) -> tuf::Result<()>
             &repo,
             &keys,
             root_signer.as_ref(),
-            (i + 1).into(), // Root version starts at 1 in step 0.
+            (i + 1).into(),
             consistent_snapshot,
         )
         .await;
